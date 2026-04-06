@@ -1,6 +1,21 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+fn next_shell_command_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> String {
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::RunUserShellCommand { command }) => return command,
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => {
+                panic!("expected RunUserShellCommand op but queue was empty")
+            }
+            Err(TryRecvError::Disconnected) => {
+                panic!("expected RunUserShellCommand op but channel closed")
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -21,12 +36,155 @@ async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert!(chat.pending_steers.is_empty());
-    assert_eq!(chat.queued_user_messages.len(), 1);
     assert_eq!(
-        chat.queued_user_messages.front().unwrap().text,
-        "queued before compact turn start"
+        chat.queued_user_message_texts(),
+        vec!["queued before compact turn start"]
     );
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn slash_loop_submits_first_run_and_queues_remaining_runs() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane
+        .set_composer_text("/loop 3 hi".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "hi".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected first loop run submission, got {other:?}"),
+    }
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec!["hi".to_string(), "hi".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn slash_loop_submits_next_run_only_after_completion() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane
+        .set_composer_text("/loop 3 hi".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let _ = next_submit_op(&mut op_rx);
+
+    chat.on_task_started();
+    chat.on_task_complete(/*last_agent_message*/ None, /*from_replay*/ false);
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "hi".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected second loop run submission, got {other:?}"),
+    }
+    assert_eq!(chat.queued_user_message_texts(), vec!["hi".to_string()]);
+
+    chat.on_task_started();
+    chat.on_task_complete(/*last_agent_message*/ None, /*from_replay*/ false);
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "hi".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected third loop run submission, got {other:?}"),
+    }
+    assert!(chat.queued_user_message_texts().is_empty());
+}
+
+#[tokio::test]
+async fn slash_loop_submits_first_shell_run_and_queues_remaining_runs() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane
+        .set_composer_text("/loop 3 !echo hi".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_eq!(next_shell_command_op(&mut op_rx), "echo hi");
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec!["!echo hi".to_string(), "!echo hi".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn slash_loop_submits_next_shell_run_only_after_completion() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane
+        .set_composer_text("/loop 3 !echo hi".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let _ = next_shell_command_op(&mut op_rx);
+
+    chat.on_task_started();
+    chat.on_task_complete(/*last_agent_message*/ None, /*from_replay*/ false);
+
+    assert_eq!(next_shell_command_op(&mut op_rx), "echo hi");
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec!["!echo hi".to_string()]
+    );
+
+    chat.on_task_started();
+    chat.on_task_complete(/*last_agent_message*/ None, /*from_replay*/ false);
+
+    assert_eq!(next_shell_command_op(&mut op_rx), "echo hi");
+    assert!(chat.queued_user_message_texts().is_empty());
+}
+
+#[tokio::test]
+async fn slash_loop_queues_large_counts_lazily() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane.set_composer_text(
+        "/loop 10000000 review and continue".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "review and continue".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected first loop run submission, got {other:?}"),
+    }
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    match chat.queued_user_messages.front() {
+        Some(QueuedUserMessage::Repeat {
+            user_message,
+            remaining,
+        }) => {
+            assert_eq!(user_message.text, "review and continue");
+            assert_eq!(*remaining, 9_999_999);
+        }
+        other => panic!("expected lazy repeated queue entry, got {other:?}"),
+    }
 }
 
 #[tokio::test]

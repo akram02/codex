@@ -509,11 +509,7 @@ async fn streaming_final_answer_keeps_task_running_state() {
         .set_composer_text("queued submission".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-    assert_eq!(chat.queued_user_messages.len(), 1);
-    assert_eq!(
-        chat.queued_user_messages.front().unwrap().text,
-        "queued submission"
-    );
+    assert_eq!(chat.queued_user_message_texts(), vec!["queued submission"]);
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));

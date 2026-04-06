@@ -626,9 +626,9 @@ pub(super) async fn assert_shift_left_edits_most_recent_queued_message_for_termi
 
     // Seed two queued messages.
     chat.queued_user_messages
-        .push_back(UserMessage::from("first queued".to_string()));
+        .push_back(UserMessage::from("first queued".to_string()).into());
     chat.queued_user_messages
-        .push_back(UserMessage::from("second queued".to_string()));
+        .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
     // Press Shift+Left to edit the most recent (last) queued message.
@@ -640,11 +640,7 @@ pub(super) async fn assert_shift_left_edits_most_recent_queued_message_for_termi
         "second queued".to_string()
     );
     // And the queue should now contain only the remaining (older) item.
-    assert_eq!(chat.queued_user_messages.len(), 1);
-    assert_eq!(
-        chat.queued_user_messages.front().unwrap().text,
-        "first queued"
-    );
+    assert_eq!(chat.queued_user_message_texts(), vec!["first queued"]);
 }
 
 pub(super) fn render_bottom_first_row(chat: &ChatWidget, width: u16) -> String {

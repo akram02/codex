@@ -1,0 +1,10 @@
+---
+source: tui/src/bottom_pane/chat_composer.rs
+expression: terminal.backend()
+---
+"                                                            "
+"› /loo                                                      "
+"                                                            "
+"                                                            "
+"                                                            "
+"  /loop  repeat input exactly N times: /loop <count> <input>"

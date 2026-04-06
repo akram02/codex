@@ -604,13 +604,16 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
 
     chat.set_collaboration_mask(plan_mask);
     chat.on_task_started();
-    chat.queued_user_messages.push_back(UserMessage {
-        text: "Implement the plan.".to_string(),
-        local_images: Vec::new(),
-        remote_image_urls: Vec::new(),
-        text_elements: Vec::new(),
-        mention_bindings: Vec::new(),
-    });
+    chat.queued_user_messages.push_back(
+        UserMessage {
+            text: "Implement the plan.".to_string(),
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: Vec::new(),
+            mention_bindings: Vec::new(),
+        }
+        .into(),
+    );
     chat.refresh_pending_input_preview();
 
     chat.handle_codex_event(Event {
@@ -824,9 +827,9 @@ async fn alt_up_edits_most_recent_queued_message() {
 
     // Seed two queued messages.
     chat.queued_user_messages
-        .push_back(UserMessage::from("first queued".to_string()));
+        .push_back(UserMessage::from("first queued".to_string()).into());
     chat.queued_user_messages
-        .push_back(UserMessage::from("second queued".to_string()));
+        .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
     // Press Alt+Up to edit the most recent (last) queued message.
@@ -838,11 +841,7 @@ async fn alt_up_edits_most_recent_queued_message() {
         "second queued".to_string()
     );
     // And the queue should now contain only the remaining (older) item.
-    assert_eq!(chat.queued_user_messages.len(), 1);
-    assert_eq!(
-        chat.queued_user_messages.front().unwrap().text,
-        "first queued"
-    );
+    assert_eq!(chat.queued_user_message_texts(), vec!["first queued"]);
 }
 
 #[tokio::test]
@@ -972,10 +971,10 @@ async fn enqueueing_history_prompt_multiple_times_is_stable() {
         chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     }
 
-    assert_eq!(chat.queued_user_messages.len(), 3);
-    for message in chat.queued_user_messages.iter() {
-        assert_eq!(message.text, "repeat me");
-    }
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec!["repeat me".to_string(); 3]
+    );
 }
 
 #[test]
@@ -1029,9 +1028,9 @@ async fn interrupt_restores_queued_messages_into_composer() {
 
     // Queue two user messages while the task is running.
     chat.queued_user_messages
-        .push_back(UserMessage::from("first queued".to_string()));
+        .push_back(UserMessage::from("first queued".to_string()).into());
     chat.queued_user_messages
-        .push_back(UserMessage::from("second queued".to_string()));
+        .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
     // Deliver a TurnAborted event with Interrupted reason (as if Esc was pressed).
@@ -1069,9 +1068,9 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
         .set_composer_text("current draft".to_string(), Vec::new(), Vec::new());
 
     chat.queued_user_messages
-        .push_back(UserMessage::from("first queued".to_string()));
+        .push_back(UserMessage::from("first queued".to_string()).into());
     chat.queued_user_messages
-        .push_back(UserMessage::from("second queued".to_string()));
+        .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
     chat.handle_codex_event(Event {
@@ -1086,6 +1085,36 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
         chat.bottom_pane.composer_text(),
         "first queued\nsecond queued\ncurrent draft"
     );
+    assert!(chat.queued_user_messages.is_empty());
+    assert!(
+        op_rx.try_recv().is_err(),
+        "unexpected outbound op after interrupt"
+    );
+
+    let _ = drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn interrupt_restores_single_draft_for_queued_loop_batch() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    chat.queued_user_messages
+        .push_back(QueuedUserMessage::Repeat {
+            user_message: UserMessage::from("review and continue"),
+            remaining: 10_000_000,
+        });
+    chat.refresh_pending_input_preview();
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+            turn_id: Some("turn-1".to_string()),
+            reason: TurnAbortReason::Interrupted,
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.composer_text(), "review and continue");
     assert!(chat.queued_user_messages.is_empty());
     assert!(
         op_rx.try_recv().is_err(),

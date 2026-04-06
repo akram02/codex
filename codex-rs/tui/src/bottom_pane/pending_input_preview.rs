@@ -130,9 +130,25 @@ impl PendingInputPreview {
             }
             Self::push_section_header(&mut lines, width, "Queued follow-up messages".into());
 
-            for message in &self.queued_messages {
+            let mut index = 0;
+            while index < self.queued_messages.len() {
+                let message = &self.queued_messages[index];
+                let mut repeat_count = 1;
+                while index + repeat_count < self.queued_messages.len()
+                    && self.queued_messages[index + repeat_count] == *message
+                {
+                    repeat_count += 1;
+                }
+
+                let preview_text = if repeat_count == 1 {
+                    message.clone()
+                } else {
+                    format!("{message} (x{repeat_count})")
+                };
                 let wrapped = adaptive_wrap_lines(
-                    message.lines().map(|line| Line::from(line.dim().italic())),
+                    preview_text
+                        .lines()
+                        .map(|line| Line::from(line.dim().italic())),
                     RtOptions::new(width as usize)
                         .initial_indent(Line::from("  ↳ ".dim()))
                         .subsequent_indent(Line::from("    ")),
@@ -142,6 +158,8 @@ impl PendingInputPreview {
                     wrapped,
                     Line::from("    …".dim().italic()),
                 );
+
+                index += repeat_count;
             }
         }
 
@@ -280,6 +298,26 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         queue.render(Rect::new(0, 0, width, height), &mut buf);
         assert_snapshot!("render_many_line_message", format!("{buf:?}"));
+    }
+
+    #[test]
+    fn render_repeated_messages_collapses_consecutive_duplicates() {
+        let mut queue = PendingInputPreview::new();
+        queue.queued_messages.extend([
+            "!echo hi".to_string(),
+            "!echo hi".to_string(),
+            "!echo hi".to_string(),
+            "!echo hi".to_string(),
+            "!echo hi".to_string(),
+        ]);
+        let width = 40;
+        let height = queue.desired_height(width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        queue.render(Rect::new(0, 0, width, height), &mut buf);
+        assert_snapshot!(
+            "render_repeated_messages_collapses_consecutive_duplicates",
+            format!("{buf:?}")
+        );
     }
 
     #[test]

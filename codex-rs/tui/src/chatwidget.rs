@@ -214,6 +214,7 @@ use codex_protocol::protocol::WebSearchEndEvent;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
+use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
 use codex_terminal_detection::Multiplexer;
@@ -855,8 +856,8 @@ pub(crate) struct ChatWidget {
     // history has been rendered so resumed/forked prompts keep chronological
     // order.
     suppress_initial_user_message_submit: bool,
-    // User messages queued while a turn is in progress
-    queued_user_messages: VecDeque<UserMessage>,
+    // User messages or lazy repeated-loop batches queued while a turn is in progress.
+    queued_user_messages: VecDeque<QueuedUserMessage>,
     // User messages that tried to steer a non-regular turn and must be retried first.
     rejected_steers_queue: VecDeque<UserMessage>,
     // Steers already submitted to core but not yet committed into history.
@@ -1013,6 +1014,43 @@ pub(crate) struct UserMessage {
     mention_bindings: Vec<MentionBinding>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum QueuedUserMessage {
+    Single(UserMessage),
+    Repeat {
+        user_message: UserMessage,
+        remaining: usize,
+    },
+}
+
+impl QueuedUserMessage {
+    fn preview_text(&self) -> String {
+        match self {
+            Self::Single(user_message) => user_message.text.clone(),
+            Self::Repeat {
+                user_message,
+                remaining,
+            } if *remaining == 1 => user_message.text.clone(),
+            Self::Repeat {
+                user_message,
+                remaining,
+            } => format!("{} (x{remaining})", user_message.text),
+        }
+    }
+
+    fn representative_user_message(self) -> UserMessage {
+        match self {
+            Self::Single(user_message) | Self::Repeat { user_message, .. } => user_message,
+        }
+    }
+}
+
+impl From<UserMessage> for QueuedUserMessage {
+    fn from(user_message: UserMessage) -> Self {
+        Self::Single(user_message)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 struct ThreadComposerState {
     text: String,
@@ -1039,7 +1077,7 @@ pub(crate) struct ThreadInputState {
     composer: Option<ThreadComposerState>,
     pending_steers: VecDeque<UserMessage>,
     rejected_steers_queue: VecDeque<UserMessage>,
-    queued_user_messages: VecDeque<UserMessage>,
+    queued_user_messages: VecDeque<QueuedUserMessage>,
     current_collaboration_mode: CollaborationMode,
     active_collaboration_mask: Option<CollaborationModeMask>,
     task_running: bool,
@@ -2453,9 +2491,52 @@ impl ChatWidget {
         !self.rejected_steers_queue.is_empty() || !self.queued_user_messages.is_empty()
     }
 
+    fn push_queued_user_message(&mut self, user_message: UserMessage) {
+        self.queued_user_messages.push_back(user_message.into());
+    }
+
+    fn push_front_queued_user_message(&mut self, user_message: UserMessage) {
+        self.queued_user_messages.push_front(user_message.into());
+    }
+
+    fn push_repeated_user_message(&mut self, user_message: UserMessage, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        if count == 1 {
+            self.push_queued_user_message(user_message);
+            return;
+        }
+
+        self.queued_user_messages
+            .push_back(QueuedUserMessage::Repeat {
+                user_message,
+                remaining: count,
+            });
+    }
+
     fn pop_next_queued_user_message(&mut self) -> Option<UserMessage> {
         if self.rejected_steers_queue.is_empty() {
-            self.queued_user_messages.pop_front()
+            let remove_entry = match self.queued_user_messages.front_mut() {
+                Some(QueuedUserMessage::Single(_)) => true,
+                Some(QueuedUserMessage::Repeat { remaining, .. }) => {
+                    *remaining -= 1;
+                    *remaining == 0
+                }
+                None => return None,
+            };
+
+            let entry = if remove_entry {
+                self.queued_user_messages.pop_front()
+            } else {
+                self.queued_user_messages.front().cloned()
+            };
+
+            entry.map(|queued| match queued {
+                QueuedUserMessage::Single(user_message) => user_message,
+                QueuedUserMessage::Repeat { user_message, .. } => user_message,
+            })
         } else {
             Some(merge_user_messages(
                 self.rejected_steers_queue.drain(..).collect(),
@@ -2466,6 +2547,7 @@ impl ChatWidget {
     fn pop_latest_queued_user_message(&mut self) -> Option<UserMessage> {
         self.queued_user_messages
             .pop_back()
+            .map(QueuedUserMessage::representative_user_message)
             .or_else(|| self.rejected_steers_queue.pop_back())
     }
 
@@ -3063,8 +3145,9 @@ impl ChatWidget {
     /// Each pending message numbers attachments from `[Image #1]` relative to its own remote
     /// images. When we concatenate multiple messages after interrupt, we must renumber local-image
     /// placeholders in a stable order and rebase text element byte ranges so the restored composer
-    /// state stays aligned with the merged attachment list. Returns `None` when there is nothing to
-    /// restore.
+    /// state stays aligned with the merged attachment list. Lazy `/loop` batches collapse to a
+    /// single representative draft here so interrupting a very large loop does not materialize an
+    /// unbounded composer payload. Returns `None` when there is nothing to restore.
     fn drain_pending_messages_for_restore(&mut self) -> Option<UserMessage> {
         if self.pending_steers.is_empty() && !self.has_queued_follow_up_messages() {
             return None;
@@ -3084,7 +3167,11 @@ impl ChatWidget {
                 .drain(..)
                 .map(|steer| steer.user_message),
         );
-        to_merge.extend(self.queued_user_messages.drain(..));
+        to_merge.extend(
+            self.queued_user_messages
+                .drain(..)
+                .map(QueuedUserMessage::representative_user_message),
+        );
         if !existing_message.text.is_empty()
             || !existing_message.local_images.is_empty()
             || !existing_message.remote_image_urls.is_empty()
@@ -5052,6 +5139,9 @@ impl ChatWidget {
                 }
                 self.app_event_tx.compact();
             }
+            SlashCommand::Loop => {
+                self.add_error_message("Usage: /loop <count> <input>".to_string());
+            }
             SlashCommand::Review => {
                 self.open_review_popup();
             }
@@ -5366,6 +5456,100 @@ impl ChatWidget {
 
         let trimmed = args.trim();
         match cmd {
+            SlashCommand::Loop if !trimmed.is_empty() => {
+                let parse_loop_args = |value: &str| -> Result<(usize, usize), String> {
+                    let Some(first_whitespace) = value.find(char::is_whitespace) else {
+                        return Err("Usage: /loop <count> <input>".to_string());
+                    };
+                    let count_text = &value[..first_whitespace];
+                    let remainder = &value[first_whitespace..];
+                    let prompt_offset = first_whitespace
+                        + remainder.len().saturating_sub(remainder.trim_start().len());
+                    if prompt_offset >= value.len() {
+                        return Err("Usage: /loop <count> <input>".to_string());
+                    }
+
+                    let count = count_text
+                        .parse::<usize>()
+                        .map_err(|_| "Loop count must be a positive integer.".to_string())?;
+                    if count == 0 {
+                        return Err("Loop count must be greater than 0.".to_string());
+                    }
+
+                    Ok((count, prompt_offset))
+                };
+
+                if let Err(message) = parse_loop_args(trimmed) {
+                    self.add_error_message(message);
+                    return;
+                }
+
+                let Some((prepared_args, prepared_elements)) = self
+                    .bottom_pane
+                    .prepare_inline_args_submission(/*record_history*/ true)
+                else {
+                    return;
+                };
+                let Ok((count, prompt_offset)) = parse_loop_args(&prepared_args) else {
+                    self.add_error_message("Usage: /loop <count> <input>".to_string());
+                    return;
+                };
+                let prompt_text = prepared_args[prompt_offset..].to_string();
+
+                let prompt_elements = prepared_elements
+                    .into_iter()
+                    .filter_map(|element| {
+                        let start = element.byte_range.start;
+                        let end = element.byte_range.end;
+                        if end <= prompt_offset {
+                            return None;
+                        }
+
+                        let new_start = start.saturating_sub(prompt_offset);
+                        let new_end = end.saturating_sub(prompt_offset).min(prompt_text.len());
+                        if new_start >= new_end {
+                            return None;
+                        }
+
+                        let placeholder = prompt_text.get(new_start..new_end).map(str::to_string);
+                        Some(TextElement::new(
+                            ByteRange {
+                                start: new_start,
+                                end: new_end,
+                            },
+                            placeholder,
+                        ))
+                    })
+                    .collect();
+
+                let user_message = UserMessage {
+                    text: prompt_text,
+                    local_images: self
+                        .bottom_pane
+                        .take_recent_submission_images_with_placeholders(),
+                    remote_image_urls: self.take_remote_image_urls(),
+                    text_elements: prompt_elements,
+                    mention_bindings: self.bottom_pane.take_recent_submission_mention_bindings(),
+                };
+                let Some(user_message) = self.maybe_defer_user_message_for_realtime(user_message)
+                else {
+                    return;
+                };
+
+                if self.is_session_configured() && !self.bottom_pane.is_task_running() {
+                    self.reasoning_buffer.clear();
+                    self.full_reasoning_buffer.clear();
+                    self.set_status_header(String::from("Working"));
+                    if count > 1 {
+                        self.push_repeated_user_message(user_message.clone(), count - 1);
+                        self.refresh_pending_input_preview();
+                    }
+                    self.submit_user_message(user_message);
+                } else {
+                    self.push_repeated_user_message(user_message, count);
+                    self.refresh_pending_input_preview();
+                }
+            }
             SlashCommand::Fast => {
                 if trimmed.is_empty() {
                     self.dispatch_command(cmd);
@@ -5557,7 +5741,7 @@ impl ChatWidget {
 
     fn queue_user_message(&mut self, user_message: UserMessage) {
         if !self.is_session_configured() || self.bottom_pane.is_task_running() {
-            self.queued_user_messages.push_back(user_message);
+            self.push_queued_user_message(user_message);
             self.refresh_pending_input_preview();
         } else {
             self.submit_user_message(user_message);
@@ -5567,7 +5751,7 @@ impl ChatWidget {
     fn submit_user_message(&mut self, user_message: UserMessage) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
-            self.queued_user_messages.push_front(user_message);
+            self.push_front_queued_user_message(user_message);
             self.refresh_pending_input_preview();
             return;
         }
@@ -7247,7 +7431,7 @@ impl ChatWidget {
         let queued_messages: Vec<String> = self
             .queued_user_messages
             .iter()
-            .map(|m| m.text.clone())
+            .map(QueuedUserMessage::preview_text)
             .collect();
         let pending_steers: Vec<String> = self
             .pending_steers
@@ -10383,7 +10567,13 @@ impl ChatWidget {
             .chain(
                 self.queued_user_messages
                     .iter()
-                    .map(|message| message.text.clone()),
+                    .flat_map(|message| match message {
+                        QueuedUserMessage::Single(user_message) => vec![user_message.text.clone()],
+                        QueuedUserMessage::Repeat {
+                            user_message,
+                            remaining,
+                        } => vec![user_message.text.clone(); *remaining],
+                    }),
             )
             .collect()
     }

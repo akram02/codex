@@ -29,6 +29,7 @@ pub enum SlashCommand {
     Fork,
     Init,
     Compact,
+    Loop,
     Plan,
     Collab,
     Agent,
@@ -74,6 +75,7 @@ impl SlashCommand {
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
+            SlashCommand::Loop => "repeat input exactly N times: /loop <count> <input>",
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
@@ -130,6 +132,7 @@ impl SlashCommand {
             self,
             SlashCommand::Review
                 | SlashCommand::Rename
+                | SlashCommand::Loop
                 | SlashCommand::Plan
                 | SlashCommand::Fast
                 | SlashCommand::SandboxReadRoot
@@ -162,6 +165,7 @@ impl SlashCommand {
             SlashCommand::Diff
             | SlashCommand::Copy
             | SlashCommand::Rename
+            | SlashCommand::Loop
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Status
