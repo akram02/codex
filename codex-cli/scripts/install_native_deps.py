@@ -164,23 +164,25 @@ def main() -> int:
         "codex-command-runner",
         "rg",
     ]
+    binary_components = [BINARY_COMPONENTS[name] for name in components if name in BINARY_COMPONENTS]
 
     workflow_url = (args.workflow_url or DEFAULT_WORKFLOW_URL).strip()
     if not workflow_url:
         workflow_url = DEFAULT_WORKFLOW_URL
 
-    workflow_id = workflow_url.rstrip("/").split("/")[-1]
-    print(f"Downloading native artifacts from workflow {workflow_id}...")
+    if binary_components:
+        workflow_id = workflow_url.rstrip("/").split("/")[-1]
+        print(f"Downloading native artifacts from workflow {workflow_id}...")
 
-    with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
-        with tempfile.TemporaryDirectory(prefix="codex-native-artifacts-") as artifacts_dir_str:
-            artifacts_dir = Path(artifacts_dir_str)
-            _download_artifacts(workflow_id, artifacts_dir)
-            install_binary_components(
-                artifacts_dir,
-                vendor_dir,
-                [BINARY_COMPONENTS[name] for name in components if name in BINARY_COMPONENTS],
-            )
+        with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
+            with tempfile.TemporaryDirectory(prefix="codex-native-artifacts-") as artifacts_dir_str:
+                artifacts_dir = Path(artifacts_dir_str)
+                _download_artifacts(workflow_id, artifacts_dir)
+                install_binary_components(
+                    artifacts_dir,
+                    vendor_dir,
+                    binary_components,
+                )
 
     if "rg" in components:
         with _gha_group("Fetch ripgrep binaries"):
@@ -454,12 +456,30 @@ def extract_archive(
 
 
 def _load_manifest(manifest_path: Path) -> dict:
-    cmd = ["dotslash", "--", "parse", str(manifest_path)]
-    stdout = subprocess.check_output(cmd, text=True)
     try:
-        manifest = json.loads(stdout)
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read DotSlash manifest {manifest_path}.") from exc
+
+    if manifest_text.startswith("#!"):
+        _, _, manifest_text = manifest_text.partition("\n")
+
+    try:
+        manifest = json.loads(manifest_text)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid DotSlash manifest output from {manifest_path}.") from exc
+        cmd = ["dotslash", "--", "parse", str(manifest_path)]
+        try:
+            stdout = subprocess.check_output(cmd, text=True)
+        except FileNotFoundError as dotslash_exc:
+            raise RuntimeError(
+                f"Invalid DotSlash manifest {manifest_path} and `dotslash` is not installed."
+            ) from dotslash_exc
+        try:
+            manifest = json.loads(stdout)
+        except json.JSONDecodeError as dotslash_parse_exc:
+            raise RuntimeError(
+                f"Invalid DotSlash manifest output from {manifest_path}."
+            ) from dotslash_parse_exc
 
     if not isinstance(manifest, dict):
         raise RuntimeError(
