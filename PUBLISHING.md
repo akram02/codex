@@ -134,6 +134,10 @@ python3 codex-cli/scripts/build_npm_package.py \
 
 Run on a native Mac.
 
+Use `install_native_deps.py` to stage `rg` so the packaged binary matches the
+target architecture (copying `rg` from `PATH` can pick the wrong arch under
+Rosetta).
+
 Apple Silicon:
 
 ```bash
@@ -141,6 +145,8 @@ VERSION=0.120.0
 TARGET=aarch64-apple-darwin
 PACKAGE=codex-darwin-arm64
 TAG=darwin-arm64
+OUT="$PWD/out/$TAG"
+STAGE_ROOT="$OUT/stage"
 
 rustup target add "$TARGET"
 
@@ -149,16 +155,19 @@ rustup target add "$TARGET"
   cargo build --release --target "$TARGET" --bin codex
 )
 
-VENDOR="$PWD/out/$TAG/vendor"
-mkdir -p "$VENDOR/$TARGET/codex" "$VENDOR/$TARGET/path"
+rm -rf "$STAGE_ROOT"
+mkdir -p "$STAGE_ROOT"
+python3 codex-cli/scripts/install_native_deps.py --component rg "$STAGE_ROOT"
+
+VENDOR="$STAGE_ROOT/vendor"
+mkdir -p "$VENDOR/$TARGET/codex"
 cp "codex-rs/target/$TARGET/release/codex" "$VENDOR/$TARGET/codex/codex"
-cp "$(command -v rg)" "$VENDOR/$TARGET/path/rg"
 
 python3 codex-cli/scripts/build_npm_package.py \
   --package "$PACKAGE" \
   --release-version "$VERSION" \
   --vendor-src "$VENDOR" \
-  --pack-output "$PWD/out/$TAG/akramkhan-codex-$VERSION-$TAG.tgz"
+  --pack-output "$OUT/akramkhan-codex-$VERSION-$TAG.tgz"
 ```
 
 Intel Mac:
@@ -168,6 +177,8 @@ VERSION=0.120.0
 TARGET=x86_64-apple-darwin
 PACKAGE=codex-darwin-x64
 TAG=darwin-x64
+OUT="$PWD/out/$TAG"
+STAGE_ROOT="$OUT/stage"
 
 rustup target add "$TARGET"
 
@@ -176,16 +187,19 @@ rustup target add "$TARGET"
   cargo build --release --target "$TARGET" --bin codex
 )
 
-VENDOR="$PWD/out/$TAG/vendor"
-mkdir -p "$VENDOR/$TARGET/codex" "$VENDOR/$TARGET/path"
+rm -rf "$STAGE_ROOT"
+mkdir -p "$STAGE_ROOT"
+python3 codex-cli/scripts/install_native_deps.py --component rg "$STAGE_ROOT"
+
+VENDOR="$STAGE_ROOT/vendor"
+mkdir -p "$VENDOR/$TARGET/codex"
 cp "codex-rs/target/$TARGET/release/codex" "$VENDOR/$TARGET/codex/codex"
-cp "$(command -v rg)" "$VENDOR/$TARGET/path/rg"
 
 python3 codex-cli/scripts/build_npm_package.py \
   --package "$PACKAGE" \
   --release-version "$VERSION" \
   --vendor-src "$VENDOR" \
-  --pack-output "$PWD/out/$TAG/akramkhan-codex-$VERSION-$TAG.tgz"
+  --pack-output "$OUT/akramkhan-codex-$VERSION-$TAG.tgz"
 ```
 
 ## Build Windows
